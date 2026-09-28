@@ -8,6 +8,13 @@
 `POST /v1/issuance/check-csr` 接收一份不超过 64 KiB 的 PEM PKCS#10 CSR：用 `cryptography` 校验
 CSR 签名后，**仅从 subjectAltName 提取 1～20 个 dNSName**（缺失 SAN 或含其他标识均拒绝，绝不以
 CN 兜底），按 SAN 顺序逐个套用同一套 CAA 判定并共享一次记录准备，任一标识未获授权则整份 CSR 不可受理。
+同请求还可**可选**再附叶证书与签发者证书的 PEM 及 UTC 校验时刻（三项须同时给出，缺项返回 422）：
+原样完成 CSR 验签与 CAA 判定后，再核对叶证书与 CSR 的 **SPKI DER 公钥**与**规范化 SAN DNSName 集合**
+（通配符沿用同一套规则；缺 SAN、非 DNS 标识、重名、缺名或多名均判不符，绝不以 CN 补齐），
+核对叶证书 issuer 与签发者 subject、按 **RSA PKCS#1 v1.5 或 ECDSA** 验证叶证书签名，
+并确认校验时刻位于证书有效期；结果以独立的 `issuance_match`（含逐项原因）返回，
+畸形 PEM 或不支持的算法返回 422，公钥 / SAN / 签名 / 日期不符返回 HTTP 200 + `matches=false`，
+结论**仅针对所给签发者**，不建立证书链信任。
 `POST /v1/issuance/check-dns01` 离线核验 ACME **DNS-01** 挑战（RFC 8555 §8.4）：输入一个 RSA JWK、
 1～20 个带唯一 id 的挑战（domain、wildcard、无填充 base64url token）与最多 100 条 TXT/CNAME，
 按 RFC 7638 计算 JWK thumbprint，在精确名 `_acme-challenge.<domain>` 上（通配符与普通挑战同名、
@@ -429,11 +436,17 @@ DNS 记录集，先用 `cryptography` 校验 CSR 自身签名，再**只从 subj
 
 请求体：
 
-| 字段      | 类型            | 必填 | 说明                                                         |
-| --------- | --------------- | ---- | ------------------------------------------------------------ |
-| `csr`     | string          | 是   | PEM PKCS#10 CSR 文本，不超过 64 KiB（65536 字节）            |
-| `ca`      | string          | 是   | 签发 CA 的域名（忽略大小写与尾点）                           |
-| `records` | array ≤ 100 条  | 否   | 离线 DNS 记录集（与 `/v1/authorize` 相同的 CAA / CNAME 记录）     |
+| 字段                   | 类型            | 必填 | 说明                                                         |
+| ---------------------- | --------------- | ---- | ------------------------------------------------------------ |
+| `csr`                  | string          | 是   | PEM PKCS#10 CSR 文本，不超过 64 KiB（65536 字节）            |
+| `ca`                   | string          | 是   | 签发 CA 的域名（忽略大小写与尾点）                           |
+| `records`              | array ≤ 100 条  | 否   | 离线 DNS 记录集（与 `/v1/authorize` 相同的 CAA / CNAME 记录）     |
+| `leaf_certificate`     | string          | 否   | 已签发叶证书的 PEM（≤ 64 KiB）；与下两项**必须同时给出或全部省略** |
+| `issuer_certificate`   | string          | 否   | 签发者证书的 PEM（≤ 64 KiB）；叶证书 issuer 与签名按它核对   |
+| `verification_time`    | string          | 否   | UTC 校验时刻，ISO 8601 / RFC 3339，**必须带时区**（如 `Z`）  |
+
+> 三个签发核对字段是**全有或全无**：只交其中 1～2 个返回 HTTP 422；全部省略时请求与响应与
+> 原先完全一致（不含 `issuance_match`）。
 
 CSR / SAN 规则（任一不满足均返回 **422**，`error_type=CSRError`）：
 
@@ -472,6 +485,33 @@ CSR / SAN 规则（任一不满足均返回 **422**，`error_type=CSRError`）�
 | `identifiers[].authorized`          | 该标识是否获授权                                                    |
 | `identifiers[].effective_owner`     | 该标识查找命中的生效 CAA owner（无则 `null`）                       |
 | `identifiers[].reason` / `.trace`   | 该标识的判定理由与完整逐级 / 逐跳轨迹（结构同 `/v1/authorize`）     |
+| `issuance_match`                     | **仅当三个签发字段全部给出时出现**：叶证书相对 CSR / 签发者的核对结果 |
+| `issuance_match.matches`             | 五项核对全部通过才为 `true`；与 `authorized` 相互独立               |
+| `issuance_match.reason`              | 人读整体结论（含全部未通过的检查名）                                 |
+| `issuance_match.checks[]`            | 逐项核对结果，固定顺序：`public_key`、`san`、`issuer`、`signature`、`validity` |
+| `issuance_match.checks[].check` / `.matches` / `.reason` | 检查名、是否相符与该项人读原因（五项全部给出，不短路） |
+
+签发核对规则（三项签发字段全部给出时）：
+
+1. **先原样完成 CSR 验签与 CAA 判定**：前述 CSR / SAN / 记录 / 别名 422 规则完全不变；
+   `authorized` 只反映 CAA 授权结论，与签发核对互不影响。
+2. **公钥（`public_key`）**：叶证书的 SubjectPublicKeyInfo DER 必须与 CSR 的 SPKI DER
+   **逐字节相同**（同一把公钥被签发）；不同密钥对即不符。
+3. **SAN 集合（`san`）**：叶证书 SAN 的 DNSName 用与 CSR **完全相同**的规范化规则
+   （忽略大小写与单个尾点、仅允许最左 `*.` 通配符）得到的**集合**必须与 CSR 相等：
+   缺 SAN、含 IP/URI/email 等非 DNS 标识、规范化后重名、缺名或多名均判不符；
+   叶证书 subject CN **从不参与**补齐。`*.example.com` 与 `example.com` 互不相等。
+4. **签发者名（`issuer`）**：叶证书 issuer Name（DER 逐字节）必须等于签发者证书 subject。
+5. **签名（`signature`）**：用签发者证书公钥验证叶证书对 tbsCertificate 的签名，仅接受
+   **RSA PKCS#1 v1.5** 与 **ECDSA**（sha1/sha224/sha256/sha384/sha512）；签名 OID 与密钥
+   类型不匹配或签名验证失败判不符；遇到不支持的签名算法 OID（Ed25519/Ed448、DSA、RSA-PSS 等）
+   返回 **422**。
+6. **有效期（`validity`）**：校验时刻必须满足 `notBefore ≤ t ≤ notAfter`（边界秒本身有效）；
+   未生效或已过期判不符。时刻由调用方给出，可复盘历史时刻。
+7. **结论边界**：`issuance_match` **只针对请求所给的这一张签发者证书**：不向上构建链、
+   不查吊销、不校验签发者证书自身是否可信。畸形叶 / 签发者 PEM、证书公钥或签名算法无法处理、
+   PEM 超过 64 KiB、校验时刻缺时区均返回 **422**（`error_type=IssuanceError`）；
+   其余「能解析但不相符」一律为 HTTP 200 + `matches=false`（附逐项原因），即使 CAA 判定本身拒绝签发。
 
 先用 openssl 生成一份带两个 SAN 的 CSR，再调用接口（`jq` 把 PEM 文本原样放入 `csr` 字段）：
 
@@ -536,6 +576,98 @@ jq -n --rawfile csr /tmp/csr.pem \
 错误请求示例：篡改 CSR 签名 → HTTP 422，`{"detail":"CSR signature is invalid","error_type":"CSRError"}`；
 SAN 含 IP 地址、缺少 SAN（只有 CN）、DNSName 超 20 个、名称非法或规范化后重名同样返回 422；
 任一标识查找时命中 CNAME 成环则返回 `error_type=CNAMELoopError`。
+
+附上三项签发字段后，响应额外给出 `issuance_match`。下面用 `cryptography` 离线生成 CSR、
+签发者证书与叶证书（叶证书 SAN 与 CSR 一致、由签发者签名），再调用接口：
+
+```bash
+python3 - <<'PY'
+import datetime, json, urllib.request
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
+
+now = datetime.datetime(2026, 9, 20, tzinfo=datetime.timezone.utc)
+def name(cn):
+    return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+
+csr_key = ec.generate_private_key(ec.SECP256R1())
+csr = (x509.CertificateSigningRequestBuilder().subject_name(name("www.example.com"))
+       .add_extension(x509.SubjectAlternativeName(
+           [x509.DNSName("www.example.com"), x509.DNSName("api.example.com")]),
+           critical=False).sign(csr_key, hashes.SHA256()))
+ca_key = rsa.generate_private_key(65537, 2048)
+issuer = (x509.CertificateBuilder().subject_name(name("Example Issuing CA R1"))
+          .issuer_name(name("Example Issuing CA R1")).public_key(ca_key.public_key())
+          .serial_number(0x1001)
+          .not_valid_before(now - datetime.timedelta(days=10))
+          .not_valid_after(now + datetime.timedelta(days=3650))
+          .sign(ca_key, hashes.SHA256()))
+leaf = (x509.CertificateBuilder().subject_name(name("www.example.com"))
+        .issuer_name(issuer.subject).public_key(csr_key.public_key())
+        .serial_number(0x2002)
+        .add_extension(x509.SubjectAlternativeName(
+            [x509.DNSName("api.example.com"), x509.DNSName("www.example.com")]),
+            critical=False)
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=90))
+        .sign(ca_key, hashes.SHA256()))
+
+body = {
+    "csr": csr.public_bytes(serialization.Encoding.PEM).decode(),
+    "ca": "letsencrypt.org",
+    "records": [{"type":"CAA","owner":"example.com","flag":0,
+                 "tag":"issue","value":"letsencrypt.org"}],
+    "leaf_certificate": leaf.public_bytes(serialization.Encoding.PEM).decode(),
+    "issuer_certificate": issuer.public_bytes(serialization.Encoding.PEM).decode(),
+    "verification_time": "2026-09-28T00:00:00Z",
+}
+req = urllib.request.Request("http://localhost:8080/v1/issuance/check-csr",
+    data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+print(urllib.request.urlopen(req).read().decode())
+PY
+```
+
+```json
+{
+  "csr_sha256": "...",
+  "authorized": true,
+  "reason": "all 2 SAN identifier(s) authorized for CA letsencrypt.org",
+  "identifiers": [ "...同前..." ],
+  "issuance_match": {
+    "matches": true,
+    "reason": "issued leaf certificate matches the CSR and is signed by and valid under the supplied issuer certificate",
+    "checks": [
+      {"check": "public_key", "matches": true,
+       "reason": "leaf certificate public key matches the CSR public key (SPKI DER)"},
+      {"check": "san", "matches": true,
+       "reason": "normalized SAN DNSName set matches the CSR: {api.example.com, www.example.com}"},
+      {"check": "issuer", "matches": true,
+       "reason": "leaf certificate issuer name matches the issuer certificate subject"},
+      {"check": "signature", "matches": true,
+       "reason": "leaf certificate signature verifies with the issuer certificate (RSA PKCS#1 v1.5/ECDSA)"},
+      {"check": "validity", "matches": true,
+       "reason": "verification time 2026-09-28T00:00:00Z lies within the leaf validity window (2026-09-19T00:00:00Z .. 2026-12-19T00:00:00Z)"}
+    ]
+  }
+}
+```
+
+签发核对失败示例（HTTP 仍为 200；五项检查都会返回，不短路）：
+
+- 公钥不符：`public_key` → `"leaf certificate SubjectPublicKeyInfo does not match the CSR public key"`；
+- SAN 多名：`san` → `"leaf certificate SAN DNSName set does not match the CSR: unexpected extra ['extra.example.com']"`；
+- 叶证书无 SAN（只有 CN）：`san` → `"leaf certificate carries no subjectAltName extension; the subject CN is not used as a fallback"`；
+- 签发者不符：`issuer` → `"leaf certificate issuer name does not match the issuer certificate subject"`，同时 `signature` 不符；
+- 签名错误：`signature` → `"leaf certificate signature does not verify with the issuer certificate (...)"`；
+- 已过期：`validity` → `"leaf certificate is expired: notAfter ... is before the verification time ..."`；
+- 整体原因形如 `"issued leaf certificate fails 2 check(s): san, validity"`。
+
+畸形 / 不支持的输入返回 **422**，`error_type=IssuanceError`，例如叶 / 签发者 PEM 无法解析
+（`"invalid leaf certificate PEM: ..."`）、PEM 超过 64 KiB、不支持的叶证书签名算法
+（`"unsupported leaf signature algorithm OID 1.3.101.112 (only RSA PKCS#1 v1.5 and ECDSA are accepted)"`）；
+三个签发字段只交 1～2 个、校验时刻缺时区同样返回 422。
 
 ### `POST /v1/issuance/check-dns01`
 
@@ -1147,6 +1279,8 @@ app/
   engine.py     # 记录准备（prepare_records → 不可变索引）与查询判定（evaluate_prepared）分离；
               # 规范化、逐级上溯、CNAME 链、判定规则（纯逻辑，无 I/O）
   csr.py        # PKCS#10 CSR 解析、签名校验与 SAN DNSName 提取（cryptography）
+  issuance.py   # 已签发叶证书核对：SPKI DER 公钥、规范化 SAN DNSName 集合、
+              # issuer/subject 名、RSA PKCS#1 v1.5/ECDSA 签名与有效期（逐项原因）
   dns01.py      # ACME DNS-01 离线核验：RSA JWK 校验、RFC 7638 thumbprint、
               # TXT chunks 按序拼接比对、精确名 CNAME 链（8 跳 / 成环，不上溯）
   ocsp.py       # OCSP 离线核验：PEM/DER 解析、CertID 重算、响应者核对、
@@ -1157,8 +1291,9 @@ app/
 tests/
   test_api.py             # 48 条 authorize / patch-plan 端到端用例
   test_check_csr.py       # 41 条 CSR 受理检查（check-csr）用例
+  test_issuance_match.py  # 32 条已签发叶证书核对（check-csr issuance_match）用例
   test_check_dns01.py     # 60 条 ACME DNS-01 离线核验（check-dns01）用例
-  test_check_ocsp.py      # 56 条 OCSP 离线核验（check-ocsp）用例
+  test_check_ocsp.py      # 57 条 OCSP 离线核验（check-ocsp）用例
   test_change_impact.py   # 28 条变更影响审查（change-impact）用例
   test_export_zone.py     # 26 条 zone 导出（export-zone）用例
   test_issuance_route.py  # 24 条批量签发路由用例（pytest + TestClient）

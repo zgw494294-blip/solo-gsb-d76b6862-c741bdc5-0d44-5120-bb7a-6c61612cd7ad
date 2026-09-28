@@ -21,12 +21,14 @@ from .engine import (
     rollout_window,
     route_issuance,
 )
+from .issuance import match_issuance
 from .ocsp import verify_ocsp
 from .schemas import (
     AuthorizeRequest,
     AuthorizeResponse,
     ChangeImpactRequest,
     ChangeImpactResponse,
+    CheckCSRIssuanceResponse,
     CheckCSRRequest,
     CheckCSRResponse,
     CheckDNS01Request,
@@ -37,6 +39,8 @@ from .schemas import (
     ExportZoneResponse,
     ImportZoneRequest,
     ImportZoneResponse,
+    IssuanceCheckResult,
+    IssuanceMatch,
     IssuanceRouteRequest,
     IssuanceRouteResponse,
     MinimizeRequest,
@@ -62,9 +66,10 @@ app = FastAPI(
 async def caa_error_handler(_: Request, exc: CAAError) -> JSONResponse:
     # All engine-level failures (bad names, mixed RRs, multiple CNAMEs,
     # alias loops, >8 hops), CSR parse/signature/SAN failures, JWK/token
-    # failures, OCSP PEM/DER/algorithm failures and zone-import failures
-    # are client errors and map to HTTP 422. Zone-import errors additionally
-    # carry the source line.
+    # failures, OCSP PEM/DER/algorithm failures, issued-certificate
+    # PEM/algorithm failures and zone-import failures are client errors
+    # and map to HTTP 422. Zone-import errors additionally carry the
+    # source line.
     content: dict = {"detail": str(exc), "error_type": exc.__class__.__name__}
     line = getattr(exc, "line", None)
     if line is not None:
@@ -167,11 +172,12 @@ async def issuance_route(payload: IssuanceRouteRequest) -> IssuanceRouteResponse
 
 @app.post(
     "/v1/issuance/check-csr",
-    response_model=CheckCSRResponse,
     tags=["caa"],
-    summary="Verify a CSR and authorize every SAN DNS name",
+    summary="Verify a CSR, authorize every SAN DNS name, and optionally match an issued leaf",
 )
-async def issuance_check_csr(payload: CheckCSRRequest) -> CheckCSRResponse:
+async def issuance_check_csr(
+    payload: CheckCSRRequest,
+) -> CheckCSRIssuanceResponse | CheckCSRResponse:
     if len(payload.csr.encode("utf-8")) > MAX_CSR_BYTES:
         raise CSRError("CSR exceeds 64 KiB (65536 bytes)")
     info = inspect_csr(payload.csr)
@@ -183,7 +189,36 @@ async def issuance_check_csr(payload: CheckCSRRequest) -> CheckCSRResponse:
         ca=payload.ca,
         records=[r.model_dump() for r in payload.records],
     )
-    return CheckCSRResponse(csr_sha256=info.sha256, **result)
+    if payload.leaf_certificate is None:
+        # Original request/response shape: the issuance verdict is only
+        # added when the three issuance fields are all supplied.
+        return CheckCSRResponse(csr_sha256=info.sha256, **result)
+
+    # The model-level all-or-nothing validator guarantees that once the
+    # leaf certificate is present the other two fields are set as well.
+    assert payload.issuer_certificate is not None
+    assert payload.verification_time is not None
+    verdict = match_issuance(
+        csr_spki_der=info.spki_der,
+        csr_names=frozenset(n.name for n in info.names),
+        leaf_pem=payload.leaf_certificate,
+        issuer_pem=payload.issuer_certificate,
+        verification_time=payload.verification_time,
+    )
+    return CheckCSRIssuanceResponse(
+        csr_sha256=info.sha256,
+        issuance_match=IssuanceMatch(
+            matches=verdict.matches,
+            reason=verdict.reason,
+            checks=[
+                IssuanceCheckResult(
+                    check=item.check, matches=item.matches, reason=item.reason
+                )
+                for item in verdict.checks
+            ],
+        ),
+        **result,
+    )
 
 
 @app.post(

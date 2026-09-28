@@ -377,7 +377,13 @@ class IssuanceRouteResponse(BaseModel):
 
 
 class CheckCSRRequest(BaseModel):
-    """A PEM PKCS#10 CSR to verify and authorize against the record set."""
+    """A PEM PKCS#10 CSR to verify and authorize against the record set.
+
+    The three issuance fields are an all-or-nothing add-on: absent, the
+    response is the CSR/CAA verdict only; present together, the issued
+    leaf certificate is additionally checked against the CSR and the
+    supplied issuer certificate.
+    """
 
     csr: str = Field(
         ...,
@@ -390,11 +396,70 @@ class CheckCSRRequest(BaseModel):
         max_length=100,
         description="Up to 100 CAA/CNAME records used as the offline DNS view",
     )
+    leaf_certificate: Optional[StrictStr] = Field(
+        None,
+        min_length=1,
+        description=(
+            "Optional PEM leaf certificate to compare with the CSR; must be "
+            "sent together with issuer_certificate and verification_time"
+        ),
+    )
+    issuer_certificate: Optional[StrictStr] = Field(
+        None,
+        min_length=1,
+        description=(
+            "Optional PEM issuer certificate; must be sent together with "
+            "leaf_certificate and verification_time"
+        ),
+    )
+    verification_time: Optional[datetime] = Field(
+        None,
+        description=(
+            "Optional UTC instant at which the leaf is checked; must be "
+            "timezone-aware and sent together with both PEM certificates"
+        ),
+    )
 
     @field_validator("ca")
     @classmethod
     def _norm_ca(cls, v: str) -> str:
         return normalize_name(v, field="ca")
+
+    @field_validator("verification_time")
+    @classmethod
+    def _require_timezone(cls, v: Optional[datetime]) -> Optional[datetime]:
+        if v is not None and (v.tzinfo is None or v.utcoffset() is None):
+            raise ValueError(
+                "verification_time must be timezone-aware (use a 'Z' suffix "
+                "or an explicit UTC offset)"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _issuance_fields_all_or_nothing(self) -> "CheckCSRRequest":
+        provided = [
+            self.leaf_certificate is not None,
+            self.issuer_certificate is not None,
+            self.verification_time is not None,
+        ]
+        if any(provided) and not all(provided):
+            missing = [
+                name
+                for name, present in zip(
+                    (
+                        "leaf_certificate",
+                        "issuer_certificate",
+                        "verification_time",
+                    ),
+                    provided,
+                )
+                if not present
+            ]
+            raise ValueError(
+                "leaf_certificate, issuer_certificate and verification_time "
+                f"must all be provided together; missing: {missing}"
+            )
+        return self
 
 
 class CSRIdentifierResult(BaseModel):
@@ -425,6 +490,45 @@ class CheckCSRResponse(BaseModel):
     reason: str
     identifiers: list[CSRIdentifierResult] = Field(
         ..., description="Per-identifier results in SAN input order"
+    )
+
+
+class IssuanceCheckResult(BaseModel):
+    """One leaf-vs-CSR/issuer conformance check, in fixed check order."""
+
+    check: Literal["public_key", "san", "issuer", "signature", "validity"]
+    matches: StrictBool
+    reason: StrictStr
+
+
+class IssuanceMatch(BaseModel):
+    """Result of comparing the issued leaf with the CSR and named issuer."""
+
+    matches: StrictBool = Field(
+        ...,
+        description=(
+            "True only when the SPKI public key and normalized SAN DNSName "
+            "set equal the CSR, the issuer name matches, the leaf signature "
+            "verifies under the supplied issuer and the verification instant "
+            "is inside the validity window"
+        ),
+    )
+    reason: StrictStr
+    checks: list[IssuanceCheckResult] = Field(
+        ..., description="Per-check outcomes in fixed order"
+    )
+
+
+class CheckCSRIssuanceResponse(CheckCSRResponse):
+    """CheckCSRResponse plus the optional issuance conformance verdict."""
+
+    issuance_match: IssuanceMatch = Field(
+        ...,
+        description=(
+            "Leaf-certificate conformance verdict; present only when the "
+            "three issuance fields are supplied. Independent of 'authorized' "
+            "and only binding for the supplied issuer certificate"
+        ),
     )
 
 

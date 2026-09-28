@@ -52,13 +52,14 @@ class SANIdentifier:
 
 @dataclass(frozen=True)
 class CSRInfo:
-    """Verified CSR fingerprint plus its normalized SAN identifiers."""
+    """Verified CSR fingerprint, SPKI DER and normalized SAN identifiers."""
 
     sha256: str
     names: tuple[SANIdentifier, ...]
+    spki_der: bytes
 
 
-def _normalize_san(raw: str) -> SANIdentifier:
+def normalize_san(raw: str) -> SANIdentifier:
     """Normalize one SAN DNSName and split off a leftmost wildcard.
 
     A wildcard is only accepted as the leftmost ``*.`` label; everything
@@ -133,7 +134,7 @@ def inspect_csr(pem: str) -> CSRInfo:
             raw = general.value
         except Exception as exc:
             raise CSRError(f"SAN DNS name cannot be decoded: {exc}") from exc
-        identifier = _normalize_san(raw)
+        identifier = normalize_san(raw)
         if identifier.name in seen:
             raise CSRError(
                 f"duplicate DNS name {identifier.name!r} after normalization"
@@ -145,4 +146,12 @@ def inspect_csr(pem: str) -> CSRInfo:
         raise CSRError("subjectAltName carries no DNSName entries")
 
     der = csr.public_bytes(serialization.Encoding.DER)
-    return CSRInfo(sha256=hashlib.sha256(der).hexdigest(), names=tuple(names))
+    spki_der = csr.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return CSRInfo(
+        sha256=hashlib.sha256(der).hexdigest(),
+        names=tuple(names),
+        spki_der=spki_der,
+    )

@@ -21,6 +21,7 @@ from .engine import (
     rollout_window,
     route_issuance,
 )
+from .issuance import match_issuance
 from .ocsp import verify_ocsp
 from .schemas import (
     AuthorizeRequest,
@@ -37,6 +38,7 @@ from .schemas import (
     ExportZoneResponse,
     ImportZoneRequest,
     ImportZoneResponse,
+    IssuanceCheckResult,
     IssuanceRouteRequest,
     IssuanceRouteResponse,
     MinimizeRequest,
@@ -62,9 +64,10 @@ app = FastAPI(
 async def caa_error_handler(_: Request, exc: CAAError) -> JSONResponse:
     # All engine-level failures (bad names, mixed RRs, multiple CNAMEs,
     # alias loops, >8 hops), CSR parse/signature/SAN failures, JWK/token
-    # failures, OCSP PEM/DER/algorithm failures and zone-import failures
-    # are client errors and map to HTTP 422. Zone-import errors additionally
-    # carry the source line.
+    # failures, issuance-match PEM/algorithm failures, OCSP
+    # PEM/DER/algorithm failures and zone-import failures are client
+    # errors and map to HTTP 422. Zone-import errors additionally carry
+    # the source line.
     content: dict = {"detail": str(exc), "error_type": exc.__class__.__name__}
     line = getattr(exc, "line", None)
     if line is not None:
@@ -169,9 +172,12 @@ async def issuance_route(payload: IssuanceRouteRequest) -> IssuanceRouteResponse
     "/v1/issuance/check-csr",
     response_model=CheckCSRResponse,
     tags=["caa"],
-    summary="Verify a CSR and authorize every SAN DNS name",
+    summary=(
+        "Verify a CSR and authorize every SAN DNS name, optionally "
+        "matching an issued leaf certificate against the CSR and issuer"
+    ),
 )
-async def issuance_check_csr(payload: CheckCSRRequest) -> CheckCSRResponse:
+async def issuance_check_csr(payload: CheckCSRRequest):
     if len(payload.csr.encode("utf-8")) > MAX_CSR_BYTES:
         raise CSRError("CSR exceeds 64 KiB (65536 bytes)")
     info = inspect_csr(payload.csr)
@@ -183,7 +189,35 @@ async def issuance_check_csr(payload: CheckCSRRequest) -> CheckCSRResponse:
         ca=payload.ca,
         records=[r.model_dump() for r in payload.records],
     )
-    return CheckCSRResponse(csr_sha256=info.sha256, **result)
+    response = CheckCSRResponse(csr_sha256=info.sha256, **result)
+
+    # The certificate/issuer/time triple is all-or-none (enforced on the
+    # request model); without it the response is exactly the legacy
+    # payload (the conformance keys are omitted rather than null). With
+    # it, the CSR self-signature and CAA evaluation above ran exactly as
+    # before and the independent certificate/CSR conformance verdict is
+    # appended. It never feeds CAA and the conclusion binds only the
+    # supplied issuer (no chain is built). JSONResponse bypasses
+    # response_model serialization so the legacy shape stays untouched.
+    if payload.leaf_certificate is None:
+        content = response.model_dump(
+            exclude={"issuance_match", "issuance_reason", "issuance_checks"}
+        )
+        return JSONResponse(content)
+
+    verdict = match_issuance(
+        csr_pem=payload.csr,
+        csr_names={n.name for n in info.names},
+        leaf_pem=payload.leaf_certificate,
+        issuer_pem=payload.issuer_certificate,
+        verification_time=payload.verification_time,
+    )
+    response.issuance_match = verdict.issuance_match
+    response.issuance_reason = verdict.issuance_reason
+    response.issuance_checks = [
+        IssuanceCheckResult(**check.as_dict()) for check in verdict.checks
+    ]
+    return JSONResponse(response.model_dump())
 
 
 @app.post(

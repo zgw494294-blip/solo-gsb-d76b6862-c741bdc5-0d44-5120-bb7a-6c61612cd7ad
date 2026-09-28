@@ -58,7 +58,7 @@ class CSRInfo:
     names: tuple[SANIdentifier, ...]
 
 
-def _normalize_san(raw: str) -> SANIdentifier:
+def normalize_san_dns_name(raw: str) -> SANIdentifier:
     """Normalize one SAN DNSName and split off a leftmost wildcard.
 
     A wildcard is only accepted as the leftmost ``*.`` label; everything
@@ -133,7 +133,7 @@ def inspect_csr(pem: str) -> CSRInfo:
             raw = general.value
         except Exception as exc:
             raise CSRError(f"SAN DNS name cannot be decoded: {exc}") from exc
-        identifier = _normalize_san(raw)
+        identifier = normalize_san_dns_name(raw)
         if identifier.name in seen:
             raise CSRError(
                 f"duplicate DNS name {identifier.name!r} after normalization"

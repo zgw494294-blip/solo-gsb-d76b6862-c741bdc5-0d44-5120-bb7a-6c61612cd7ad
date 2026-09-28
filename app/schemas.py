@@ -377,7 +377,13 @@ class IssuanceRouteResponse(BaseModel):
 
 
 class CheckCSRRequest(BaseModel):
-    """A PEM PKCS#10 CSR to verify and authorize against the record set."""
+    """A PEM PKCS#10 CSR to verify and authorize against the record set.
+
+    The optional ``leaf_certificate`` / ``issuer_certificate`` /
+    ``verification_time`` triple extends the request to also check that
+    an already-issued certificate conforms to the CSR; the three are
+    all-or-none.
+    """
 
     csr: str = Field(
         ...,
@@ -390,11 +396,60 @@ class CheckCSRRequest(BaseModel):
         max_length=100,
         description="Up to 100 CAA/CNAME records used as the offline DNS view",
     )
+    leaf_certificate: Optional[StrictStr] = Field(
+        None,
+        min_length=1,
+        description=(
+            "Optional PEM leaf certificate checked against the CSR; must be "
+            "sent together with issuer_certificate and verification_time"
+        ),
+    )
+    issuer_certificate: Optional[StrictStr] = Field(
+        None,
+        min_length=1,
+        description=(
+            "Optional PEM issuer certificate; the leaf signature and issuer "
+            "name are checked against it only (no chain trust)"
+        ),
+    )
+    verification_time: Optional[datetime] = Field(
+        None,
+        description=(
+            "Optional UTC instant at which the leaf validity is evaluated; "
+            "must carry a timezone designator (e.g. '2026-01-01T00:00:00Z')"
+        ),
+    )
 
     @field_validator("ca")
     @classmethod
     def _norm_ca(cls, v: str) -> str:
         return normalize_name(v, field="ca")
+
+    @field_validator("verification_time")
+    @classmethod
+    def _require_timezone(cls, v: Optional[datetime]) -> Optional[datetime]:
+        if v is not None and (v.tzinfo is None or v.utcoffset() is None):
+            raise ValueError(
+                "verification_time must be timezone-aware (use a 'Z' suffix "
+                "or an explicit UTC offset)"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _issuance_triple_all_or_none(self) -> "CheckCSRRequest":
+        provided = [
+            self.leaf_certificate is not None,
+            self.issuer_certificate is not None,
+            self.verification_time is not None,
+        ]
+        if any(provided) and not all(provided):
+            raise ValueError(
+                "leaf_certificate, issuer_certificate and verification_time "
+                "must all be provided together (certificate/issuer PEM and "
+                "the UTC verification instant)"
+            )
+        return self
+
 
 
 class CSRIdentifierResult(BaseModel):
@@ -426,6 +481,33 @@ class CheckCSRResponse(BaseModel):
     identifiers: list[CSRIdentifierResult] = Field(
         ..., description="Per-identifier results in SAN input order"
     )
+    issuance_match: Optional[StrictBool] = Field(
+        None,
+        description=(
+            "When the leaf/issuer/verification-time triple is supplied: true "
+            "only when public key, SAN set, issuer name, signature and "
+            "validity all match; null when the triple is absent"
+        ),
+    )
+    issuance_reason: Optional[StrictStr] = Field(
+        None,
+        description="Overall certificate/CSR conformance conclusion; null without the triple",
+    )
+    issuance_checks: Optional[list["IssuanceCheckResult"]] = Field(
+        None,
+        description=(
+            "Per-item conformance results (public_key, san, issuer_name, "
+            "signature, validity); null without the triple"
+        ),
+    )
+
+
+class IssuanceCheckResult(BaseModel):
+    """One certificate/CSR conformance check item."""
+
+    check: Literal["public_key", "san", "issuer_name", "signature", "validity"]
+    match: StrictBool
+    reason: StrictStr
 
 
 class RSAJWK(BaseModel):
